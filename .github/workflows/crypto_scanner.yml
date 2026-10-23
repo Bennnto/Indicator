@@ -1,8 +1,11 @@
-name: 24/7 Crypto Analyst Scanner
+name: Crypto Market Scanner
 
 on:
   schedule:
-    # Runs automatically every 30 minutes (:00 and :30) 24/7 in GitHub Cloud
+    # Runs every 30 minutes 24/7 in GitHub Cloud:
+    # - Detects good trade signals immediately at any 30m mark
+    # - Sends morning briefing at 9:00 AM (13:00 UTC)
+    # - Sends evening briefing at 7:00 PM (23:00 UTC)
     - cron: '*/30 * * * *'
   workflow_dispatch: # Allows manual "Run workflow" button in GitHub web or mobile app
 
@@ -26,8 +29,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install ccxt pandas feedparser requests numpy
 
-      - name: Run Crypto AI Analyst
+      - name: Run Crypto Scanner
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'ben-secret107468' }}
+          IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' && '--manual' || '' }}
         run: |
-          python src/main.py --once
+          python src/main.py --once $IS_MANUAL

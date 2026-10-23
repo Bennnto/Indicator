@@ -2,6 +2,10 @@ import ccxt
 import time
 import argparse
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 from data_engine import fetch_multi_timeframe, coins, get_binance_exchange
 from indicators import analyze_technicals
@@ -155,14 +159,19 @@ def format_alert_body(d: dict) -> str:
     )
 
 
-def run_scanner_cycle(exchange):
-    """Executes a single scan cycle across all monitored coins."""
+def run_scanner_cycle(exchange, is_scheduled_summary: bool = False, is_manual_run: bool = False):
+    """
+    Executes a single scan cycle across all monitored coins.
+    - If actionable trade signal: immediately dispatches high-priority alert.
+    - If is_scheduled_summary (9:00 AM or 7:00 PM briefing) or is_manual_run: sends briefing notification even if 0 setups.
+    """
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n{'='*60}")
     print(f"📡 SCAN CYCLE STARTED: {now_str}")
     print(f"{'='*60}")
 
     approved_count = 0
+    scanned_results = []
 
     for pair in coins:
         try:
@@ -171,6 +180,7 @@ def run_scanner_cycle(exchange):
                 print(f"⚠️ {pair}: {d.get('message')}")
                 continue
 
+            scanned_results.append(d)
             status_icon = "🟢" if d['is_approved'] else "⚪"
             print(f"{status_icon} {pair:<10} | {d['final_decision']:<26} | Trend: {d['macro_trend']:<7} | RSI: {d['rsi']:<4} | News: {d['news_sentiment']}")
 
@@ -197,6 +207,39 @@ def run_scanner_cycle(exchange):
     print(f"{'='*60}")
     print(f"🏁 Cycle complete. {approved_count} actionable setup(s) found.")
 
+    # If this was a scheduled 9:00 AM / 7:00 PM briefing OR a manual workflow run, send summary notification
+    if (is_scheduled_summary or is_manual_run) and approved_count == 0:
+        dispatch_briefing_notification(scanned_results, is_manual=is_manual_run)
+
+
+def dispatch_briefing_notification(results: list, is_manual: bool = False):
+    """Sends a market briefing at 9:00 AM / 7:00 PM or upon manual workflow dispatch."""
+    ny_tz = ZoneInfo("America/New_York")
+    now_ny = datetime.now(ny_tz)
+    time_str = now_ny.strftime("%I:%M %p %Z")
+
+    title = "Market Check" if is_manual else f"Market Briefing ({now_ny.strftime('%I:%M %p')})"
+
+    body_lines = [
+        f"📊 {title} - {time_str}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"Monitored: {len(results)} pairs | Setups: 0 (Consolidation/Wait)",
+        ""
+    ]
+    for r in results:
+        trend_arrow = "↗️" if r['macro_trend'] == "BULLISH" else ("↘️" if r['macro_trend'] == "BEARISH" else "➡️")
+        body_lines.append(f"• {r['symbol']}: ${r['live_price']:,.2f} | 1h: {trend_arrow} {r['macro_trend']} | RSI: {r['rsi']}")
+
+    body_lines.append("\n💡 Monitoring 24/7. Will alert immediately when a high-probability trade confirms.")
+    summary_message = "\n".join(body_lines)
+
+    send_alert(
+        summary_message,
+        title=f"📊 {title}: {len(results)} pairs scanned",
+        priority="default",
+        tags="bar_chart,satellite"
+    )
+
 
 def seconds_until_next_candle_close(interval_minutes: int = 30) -> int:
     """
@@ -222,7 +265,7 @@ def run_continuous_daemon(interval_minutes: int = 30):
     to every 30-minute boundary (:00 and :30).
     """
     exchange = get_binance_exchange()
-    print(f"🚀 Crypto Analyst Scanner Daemon Online")
+    print(f"🚀 Crypto Scanner Daemon Online")
     print(f"Data Source       : Binance Official Data API (Vision Mirror)")
     print(f"Scheduled Interval: Every {interval_minutes} minutes (Aligned with :00 and :30 boundaries)")
     print(f"Monitoring Pairs  : {', '.join(coins)}")
@@ -240,7 +283,11 @@ def run_continuous_daemon(interval_minutes: int = 30):
             print(f"\n💤 Sleeping {wait_sec // 60}m {wait_sec % 60}s until next boundary ({next_time})...")
 
             time.sleep(wait_sec)
-            run_scanner_cycle(exchange)
+
+            # Check if this cycle is 9:00 AM or 7:00 PM (19:00) EDT/EST
+            now_ny = datetime.now(ZoneInfo("America/New_York"))
+            is_briefing = (now_ny.hour in [9, 19] and now_ny.minute < 30)
+            run_scanner_cycle(exchange, is_scheduled_summary=is_briefing)
 
         except KeyboardInterrupt:
             print("\n👋 Daemon stopped by user. Goodbye!")
@@ -251,11 +298,21 @@ def run_continuous_daemon(interval_minutes: int = 30):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Crypto Analyst Scanner")
+    parser = argparse.ArgumentParser(description="Crypto Market Scanner")
     parser.add_argument(
         "--once",
         action="store_true",
         help="Run a single scan cycle and exit immediately"
+    )
+    parser.add_argument(
+        "--briefing",
+        action="store_true",
+        help="Force send a market briefing summary (used for 9:00 AM / 7:00 PM scheduled runs)"
+    )
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="Flag indicating a manual trigger from GitHub Actions"
     )
     parser.add_argument(
         "--interval",
@@ -268,6 +325,9 @@ if __name__ == "__main__":
 
     if args.once:
         exchange = get_binance_exchange()
-        run_scanner_cycle(exchange)
+        # Also auto-detect if the current time matches 9:00 AM or 7:00 PM EDT
+        now_ny = datetime.now(ZoneInfo("America/New_York"))
+        auto_briefing = args.briefing or (now_ny.hour in [9, 19] and now_ny.minute < 30)
+        run_scanner_cycle(exchange, is_scheduled_summary=auto_briefing, is_manual_run=args.manual)
     else:
         run_continuous_daemon(interval_minutes=args.interval)

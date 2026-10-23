@@ -3,33 +3,34 @@ import requests
 import subprocess
 import re
 
-
-# Default ntfy.sh topic (override with environment variable NTFY_TOPIC if set)
-DEFAULT_NTFY_TOPIC = os.getenv("NTFY_TOPIC", "ben-secret107468")
+# Robust fallback: handle empty string or unset env var
+_env_topic = os.getenv("NTFY_TOPIC", "").strip()
+DEFAULT_NTFY_TOPIC = _env_topic if _env_topic else "ben-secret107468"
 
 
 def clean_header_text(text: str) -> str:
     """
     HTTP headers only support ASCII / Latin-1 in Python requests.
-    This safely strips emojis from header values to prevent Latin-1 encoding errors.
+    This safely strips characters outside ASCII to prevent Latin-1 encoding errors.
     """
     if not text:
         return ""
-    # Remove characters outside ASCII printable range
     return re.sub(r'[^\x20-\x7E]', '', text).strip()
 
 
-def send_ntfy(message: str, title: str = "Crypto Trade Alert",
+def send_ntfy(message: str, title: str = "Trade Signal",
               topic: str = None, priority: str = "urgent",
               tags: str = "chart_with_upwards_trend,bell") -> bool:
     """
-    Sends an instant push notification to your iPhone / Android via ntfy.sh.
+    Sends an instant push notification to your phone via ntfy.sh.
     100% free, no login or account required, works from anywhere (Mac, Linux, GitHub Actions).
     """
-    channel = topic or DEFAULT_NTFY_TOPIC
+    channel = (topic or DEFAULT_NTFY_TOPIC).strip()
+    if not channel:
+        channel = "ben-secret107468"
+
     url = f"https://ntfy.sh/{channel}"
 
-    # Ensure title and tags are clean ASCII for HTTP headers
     safe_title = clean_header_text(title) or "Trade Signal"
     safe_tags = clean_header_text(tags) or "bell"
 
@@ -40,7 +41,6 @@ def send_ntfy(message: str, title: str = "Crypto Trade Alert",
     }
 
     try:
-        # Message body is sent as raw UTF-8 bytes — emojis and formatting fully work here!
         response = requests.post(
             url,
             data=message.encode('utf-8'),
@@ -91,13 +91,15 @@ def send_imessage(recipient: str, message: str) -> bool:
 
 
 def send_alert(message: str, title: str = "Trade Signal",
-               imessage_recipient: str = None) -> bool:
+               imessage_recipient: str = None,
+               priority: str = "urgent",
+               tags: str = "chart_with_upwards_trend,bell") -> bool:
     """
     Universal alert dispatcher:
     1. Sends instant lock-screen push notification via ntfy.sh (primary).
     2. Optionally mirrors to iMessage if on Mac and configured.
     """
-    ntfy_success = send_ntfy(message, title=title)
+    ntfy_success = send_ntfy(message, title=title, priority=priority, tags=tags)
 
     if imessage_recipient and not imessage_recipient.startswith("+1234567890"):
         send_imessage(imessage_recipient, message)
@@ -107,7 +109,7 @@ def send_alert(message: str, title: str = "Trade Signal",
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("📲 Notification Test")
+    print("📱 Notification Test")
     print(f"Target Topic: https://ntfy.sh/{DEFAULT_NTFY_TOPIC}")
     print("=" * 55)
 
@@ -119,7 +121,5 @@ if __name__ == "__main__":
         "Thesis: 1h Macro Uptrend confirmed + 15m RSI Pullback."
     )
 
-    print("Sending test notification...")
-    ok = send_ntfy(test_msg, title="BTC/USDT Buy Signal (Test)")
-    if ok:
-        print("✅ Success! Check your phone.")
+    res = send_alert(test_msg, title="🟢 BUY BTC/USDT @ $81,350.00 | SL: $79,800.00")
+    print("Delivered:", res)
