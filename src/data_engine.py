@@ -1,72 +1,69 @@
 import ccxt
 import pandas as pd
 import time
+import os
 
+# Monitored pairs
 coins = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 
 
 def get_binance_exchange():
     """
-    Returns a Binance CCXT client strictly locked to SPOT market endpoints.
-    Points to Binance's official data mirror (data-api.binance.vision) and
-    explicitly disables all futures (fapi/dapi) requests to prevent HTTP 451
-    geo-restriction errors on GitHub Actions and US cloud servers.
+    Creates a Binance exchange client using the official Binance Data API mirror
+    (data-api.binance.vision) for SPOT data.
+    This public mirror allows unrestricted reading of live spot candles and order books
+    from any global cloud provider (including US GitHub Actions runners) without HTTP 451.
     """
-    return ccxt.binance({
+    exchange = ccxt.binance({
         'enableRateLimit': True,
         'options': {
             'defaultType': 'spot',
-            'fetchMarkets': ['spot'],  # Strictly block any fapi / futures calls
-            'adjustForTimeDifference': True,
+            'fetchMarkets': ['spot'],
         },
         'urls': {
             'api': {
                 'public': 'https://data-api.binance.vision/api/v3',
                 'fapiPublic': 'https://data-api.binance.vision/api/v3',
-                'fapiPrivate': 'https://data-api.binance.vision/api/v3',
             }
         }
     })
+    return exchange
 
 
-def get_fallback_exchange():
-    """Global fallback exchange if Binance is unreachable from a cloud IP."""
-    return ccxt.okx({'enableRateLimit': True})
-
-
-def fetch_candles(exchange, symbol: str, timeframe: str = '1h', limit: int = 300) -> pd.DataFrame:
+def fetch_candles(exchange, symbol: str, timeframe: str = '15m', limit: int = 300) -> pd.DataFrame:
     """
-    Fetches OHLCV candles from Binance, with automatic fallback if geo-blocked.
+    Fetches raw OHLCV candles from Binance Spot with automatic fallback to OKX
+    if Binance is ever unreachable.
     """
     try:
-        bars = exchange.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
+        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not bars:
+            return pd.DataFrame()
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        print(f"⚠️ Binance {timeframe} error for {symbol}: {e}. Trying fallback exchange...")
+        print(f"⚠️ Binance data error for {symbol} ({timeframe}): {e}. Attempting fallback...")
         try:
-            fb = get_fallback_exchange()
-            bars = fb.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
-            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            print(f"✅ Fallback successful for {symbol} ({len(df)} candles)")
-            return df
+            fallback_ex = ccxt.okx({'enableRateLimit': True})
+            bars = fallback_ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if bars:
+                df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                return df
         except Exception as fb_err:
             print(f"❌ Fallback failed for {symbol}: {fb_err}")
-            return pd.DataFrame()
+        return pd.DataFrame()
 
 
-def fetch_paginated_ohlcv(exchange, symbol: str, timeframe: str = '15m', days: int = 90) -> pd.DataFrame:
+def fetch_paginated_ohlcv(exchange, symbol: str, timeframe: str = '1h', days: int = 90) -> pd.DataFrame:
     """
-    Fetches up to `days` of historical OHLCV data from Binance by paginating
-    backward through 1000-bar limits.
+    Fetches multiple months of historical data using pagination.
+    Used by backtest.py to download sufficient history for multi-month backtesting.
     """
     all_bars = []
-    limit = 1000
-
-    since_dt = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=days)
-    since_ms = int(since_dt.timestamp() * 1000)
+    limit = 500
+    since_ms = int((pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=days)).timestamp() * 1000)
 
     print(f"  📅 Fetching {days} days of {timeframe} data for {symbol}...")
 
@@ -112,10 +109,52 @@ def fetch_multi_timeframe(exchange, symbol: str,
     return {'trend': df_trend, 'trigger': df_trigger}
 
 
+def fetch_order_book_imbalance(exchange, symbol: str, depth: int = 15) -> dict:
+    """
+    Fetches live Binance order book depth to evaluate Bid/Ask volume imbalance.
+    - Ratio > 1.2: Buyers dominate (strong support wall beneath price).
+    - Ratio < 0.6: Heavy sell wall overhead (distribution / resistance).
+    """
+    try:
+        ob = exchange.fetch_order_book(symbol, limit=depth)
+        bids = ob.get('bids', [])[:depth]
+        asks = ob.get('asks', [])[:depth]
+
+        bids_vol = sum(b[1] for b in bids) if bids else 0.0
+        asks_vol = sum(a[1] for a in asks) if asks else 0.0
+
+        ratio = bids_vol / (asks_vol + 1e-8)
+        
+        if ratio > 1.2:
+            pressure = "BULLISH_SUPPORT"
+        elif ratio < 0.6:
+            pressure = "HEAVY_SELL_WALL"
+        else:
+            pressure = "BALANCED"
+
+        return {
+            "status": "SUCCESS",
+            "bid_vol": round(bids_vol, 2),
+            "ask_vol": round(asks_vol, 2),
+            "ratio": round(ratio, 2),
+            "pressure": pressure
+        }
+    except Exception as e:
+        return {
+            "status": "ERROR",
+            "message": str(e),
+            "ratio": 1.0,
+            "pressure": "BALANCED"
+        }
+
+
 if __name__ == "__main__":
     exchange = get_binance_exchange()
     print("Testing Binance Spot Vision:")
     for coin in coins:
         bars = fetch_candles(exchange, coin, timeframe='15m', limit=3)
+        ob = fetch_order_book_imbalance(exchange, coin, depth=10)
         if not bars.empty:
-            print(f"  ✅ {coin}: ${bars['close'].iloc[-1]:,.2f}")
+            print(f"✅ {coin}: Live Price ${bars['close'].iloc[-1]:,.2f} | Order Book: {ob['pressure']} (B/A Ratio: {ob['ratio']})")
+        else:
+            print(f"❌ {coin}: Failed")

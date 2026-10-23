@@ -7,9 +7,10 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-from data_engine import fetch_multi_timeframe, coins, get_binance_exchange
-from indicators import analyze_technicals
+from data_engine import fetch_multi_timeframe, coins, get_binance_exchange, fetch_order_book_imbalance
+from indicators import analyze_technicals, kelly_position_size
 from news_engine import analyze_news
+from ml_engine import predict_probability
 from notifier import send_alert, DEFAULT_NTFY_TOPIC
 
 # ======================================================================
@@ -34,21 +35,25 @@ ALERT_COOLDOWN_HOURS = 2.0
 last_alert_times = {}
 
 
-def synthesize_trade_decision(symbol: str, exchange) -> dict:
+def synthesize_trade_decision(symbol: str, exchange, btc_state: dict = None) -> dict:
     """
-    Binds Technical Analysis and News Sentiment together into one final verdict.
+    Binds Technical Indicators, Candlestick Reversals, Order Book Imbalance,
+    LightGBM Statistical Edge, and News Sentiment into one unified verdict.
     """
-    # 1. RUN TECHNICAL ANALYSIS
+    # 1. RUN TECHNICAL ANALYSIS & CANDLESTICK CHECKS
     candles = fetch_multi_timeframe(exchange, symbol)
     tech = analyze_technicals(candles['trend'], candles['trigger'], mode=TRADING_MODE)
 
     if tech.get("status") != "SUCCESS":
         return {"status": "ERROR", "message": tech.get("message")}
 
-    # 2. RUN BREAKING NEWS ANALYSIS
+    # 2. RUN ORDER BOOK DEPTH ANALYSIS
+    ob_info = fetch_order_book_imbalance(exchange, symbol, depth=15)
+
+    # 3. RUN BREAKING NEWS SENTIMENT
     news = analyze_news(symbol)
 
-    # 3. EXTRACT CORE METRICS
+    # 4. EXTRACT CORE METRICS
     raw_signal     = tech["signal"]
     action         = tech["action"]
     live_price     = tech["live_price"]
@@ -65,16 +70,67 @@ def synthesize_trade_decision(symbol: str, exchange) -> dict:
     is_dangerous   = news["is_dangerous"]
     top_headline   = news["top_headline"]
 
-    # 4. BINDING & CONFLICT FILTERING
+    # Candlestick characteristics
+    df_15m = candles['trigger']
+    if len(df_15m) >= 2:
+        last_c = df_15m.iloc[-1]
+        c_range = max(float(last_c['high']) - float(last_c['low']), 1e-8)
+        lower_wick_ratio = max(0.0, min(float(last_c['open']), float(last_c['close'])) - float(last_c['low'])) / c_range
+        candle_is_green = 1.0 if float(last_c['close']) >= float(last_c['open']) else 0.0
+    else:
+        lower_wick_ratio = 0.25
+        candle_is_green = 0.0
+
+    # 5. RUN LIGHTGBM STATISTICAL WIN PREDICTOR
+    ml_features = {
+        'rsi_15m': rsi,
+        'macd_hist_15m': tech['indicators']['macd_hist_15m'],
+        'adx_15m': adx,
+        'volume_ratio': vol_ratio,
+        'extension_from_ema50': float(tech['gaps']['extension_from_ema50'].replace('%', '')),
+        'ema50_over_ema200': 1.0 if tech['indicators']['ema50_1h'] > tech['indicators']['ema200_1h'] else 0.0,
+        'lower_wick_ratio': lower_wick_ratio,
+        'candle_is_green': candle_is_green,
+        'ob_ratio': ob_info.get('ratio', 1.0),
+        'btc_trend_bullish': 1.0 if (btc_state and btc_state.get('macro_trend') == 'BULLISH') else 0.0
+    }
+    ml_eval = predict_probability(ml_features)
+
+    # Calculate Kelly recommended position sizing
+    win_prob = ml_eval['prob']
+    kelly = kelly_position_size(win_rate=win_prob, rr_ratio=1.5, capital=1000.0, price=live_price)
+
+    # 6. BINDING & CONFLICT FILTERING
     final_decision = raw_signal
     is_approved    = False
     veto_reason    = None
     combined_notes = list(tech.get("reasons", []))
 
+    # Confluence notes
+    combined_notes.append(f"📊 Order Book: {ob_info['pressure']} (B/A Ratio: {ob_info['ratio']:.2f})")
+    combined_notes.append(f"🌲 Statistical Win Probability: {ml_eval['prob_pct']} ({ml_eval['verdict']})")
+
     if tech.get("block_reason"):
         veto_reason = tech["block_reason"]
         final_decision = "⚠️ BLOCKED BY TECHNICAL FILTER"
 
+    # BTC Market Leader Veto: Altcoins must not fight Bitcoin downtrend
+    elif symbol != "BTC/USDT" and btc_state and "BUY" in raw_signal:
+        btc_trend = btc_state.get("macro_trend", "SIDEWAYS")
+        btc_price = btc_state.get("live_price", 0)
+        btc_ema50 = btc_state.get("ema50_1h", 0)
+        if btc_trend == "BEARISH" or (btc_ema50 > 0 and btc_price < btc_ema50):
+            final_decision = "⚠️ BLOCKED (BTC MARKET LEADER VETO)"
+            veto_reason = f"BTC 1h trend is BEARISH (${btc_price:,.2f} < EMA50 ${btc_ema50:,.2f}). Altcoin longs carry dump risk."
+            combined_notes.append(f"⛔ VETO: {veto_reason}")
+
+    # Order Book Sell Wall Veto
+    elif "BUY" in raw_signal and ob_info.get("ratio", 1.0) < 0.45:
+        final_decision = "⚠️ BLOCKED (HEAVY SELL WALL)"
+        veto_reason = f"Order book asks heavily outweigh bids ({ob_info['ratio']:.2f} B/A ratio). Resistance overhead."
+        combined_notes.append(f"⛔ VETO: {veto_reason}")
+
+    # Dangerous News Veto
     elif is_dangerous and "BUY" in raw_signal:
         final_decision = "🚨 TRADE VETOED BY DANGEROUS NEWS"
         veto_reason = f"Red-flag headline: \"{top_headline}\""
@@ -90,9 +146,16 @@ def synthesize_trade_decision(symbol: str, exchange) -> dict:
         veto_reason = f"Technicals show short setup, but breaking news is BULLISH."
         combined_notes.append(f"⛔ CONFLICT: {veto_reason}")
 
+    # Statistical Probability Threshold: Must have >= 55% statistical edge
+    elif raw_signal in ["BUY SIGNAL", "SELL (SHORT)"] and win_prob < 0.55:
+        final_decision = "⚠️ BLOCKED (LOW STATISTICAL EDGE)"
+        veto_reason = f"LightGBM statistical win probability is {ml_eval['prob_pct']} (< 55.0% threshold)."
+        combined_notes.append(f"⛔ VETO: {veto_reason}")
+
     elif raw_signal in ["BUY SIGNAL", "SELL (SHORT)"]:
         is_approved = True
         combined_notes.append(f"✅ Fundamental alignment: News ({news_sentiment}) does not contradict trade.")
+        combined_notes.append(f"✅ Quantitative edge confirmed by LightGBM ({ml_eval['prob_pct']}).")
 
     return {
         "status": "SUCCESS",
@@ -111,10 +174,14 @@ def synthesize_trade_decision(symbol: str, exchange) -> dict:
         "rsi": rsi,
         "adx": adx,
         "vol_ratio": vol_ratio,
+        "order_book": ob_info,
+        "ml_eval": ml_eval,
+        "kelly": kelly,
         "news_sentiment": news_sentiment,
         "top_headline": top_headline,
         "veto_reason": veto_reason,
-        "reasons": combined_notes
+        "reasons": combined_notes,
+        "indicators": tech.get("indicators", {})
     }
 
 
@@ -140,6 +207,9 @@ def format_alert_body(d: dict) -> str:
     risk_pct = d['gaps'].get('risk_pct', 'N/A')
     tp1_pct = d['gaps'].get('tp1_pct', 'N/A')
     tp2_pct = d['gaps'].get('tp2_pct', 'N/A')
+    ob = d.get('order_book', {})
+    ml = d.get('ml_eval', {})
+    kelly = d.get('kelly', {})
 
     return (
         f"🚨 TRADE SIGNAL: {d['symbol']} ({d['mode']})\n"
@@ -153,6 +223,9 @@ def format_alert_body(d: dict) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 1h Trend    : {d['macro_trend']}\n"
         f"📊 15m RSI     : {d['rsi']}\n"
+        f"🧱 Order Book  : {ob.get('pressure', 'BALANCED')} (B/A Ratio: {ob.get('ratio', 1.0)})\n"
+        f"🎯 Win Probability: {ml.get('prob_pct', 'N/A')} ({ml.get('verdict', 'CALIBRATED')})\n"
+        f"⚖️ Position Size  : {kelly.get('risk_pct', '1.5')}% Risk (Half-Kelly Criterion)\n"
         f"📰 News        : {d['news_sentiment']}\n"
         f"Top Story      : \"{d['top_headline']}\"\n\n"
         f"💡 Thesis      : {d['reasons'][0]}"
@@ -162,8 +235,9 @@ def format_alert_body(d: dict) -> str:
 def run_scanner_cycle(exchange, is_scheduled_summary: bool = False, is_manual_run: bool = False):
     """
     Executes a single scan cycle across all monitored coins.
+    - Evaluates Bitcoin market health first for cross-market alignment.
     - If actionable trade signal: immediately dispatches high-priority alert.
-    - If is_scheduled_summary (9:00 AM or 7:00 PM briefing) or is_manual_run: sends briefing notification even if 0 setups.
+    - If scheduled 9:00 AM / 7:00 PM briefing or manual run: sends briefing even if 0 setups.
     """
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"\n{'='*60}")
@@ -173,16 +247,31 @@ def run_scanner_cycle(exchange, is_scheduled_summary: bool = False, is_manual_ru
     approved_count = 0
     scanned_results = []
 
+    # 1. Evaluate Bitcoin first to extract benchmark state for altcoins
+    btc_decision = synthesize_trade_decision("BTC/USDT", exchange, btc_state=None)
+    btc_state = {
+        "macro_trend": btc_decision.get("macro_trend", "SIDEWAYS"),
+        "live_price": btc_decision.get("live_price", 0),
+        "ema50_1h": btc_decision.get("indicators", {}).get("ema50_1h", 0)
+    } if btc_decision.get("status") == "SUCCESS" else None
+
+    # 2. Iterate through all monitored coins
     for pair in coins:
         try:
-            d = synthesize_trade_decision(pair, exchange)
+            if pair == "BTC/USDT":
+                d = btc_decision
+            else:
+                d = synthesize_trade_decision(pair, exchange, btc_state=btc_state)
+
             if d.get("status") != "SUCCESS":
                 print(f"⚠️ {pair}: {d.get('message')}")
                 continue
 
             scanned_results.append(d)
             status_icon = "🟢" if d['is_approved'] else "⚪"
-            print(f"{status_icon} {pair:<10} | {d['final_decision']:<26} | Trend: {d['macro_trend']:<7} | RSI: {d['rsi']:<4} | News: {d['news_sentiment']}")
+            ob_ratio = d.get('order_book', {}).get('ratio', 1.0)
+            ml_prob = d.get('ml_eval', {}).get('prob_pct', 'N/A')
+            print(f"{status_icon} {pair:<10} | {d['final_decision']:<26} | Trend: {d['macro_trend']:<7} | RSI: {d['rsi']:<4} | OB: {ob_ratio:.2f} | WinProb: {ml_prob}")
 
             # Check if setup is approved
             if d['is_approved']:
@@ -228,9 +317,11 @@ def dispatch_briefing_notification(results: list, is_manual: bool = False):
     ]
     for r in results:
         trend_arrow = "↗️" if r['macro_trend'] == "BULLISH" else ("↘️" if r['macro_trend'] == "BEARISH" else "➡️")
-        body_lines.append(f"• {r['symbol']}: ${r['live_price']:,.2f} | 1h: {trend_arrow} {r['macro_trend']} | RSI: {r['rsi']}")
+        ob_ratio = r.get('order_book', {}).get('ratio', 1.0)
+        prob = r.get('ml_eval', {}).get('prob_pct', 'N/A')
+        body_lines.append(f"• {r['symbol']}: ${r['live_price']:,.2f} | 1h: {trend_arrow} {r['macro_trend']} | RSI: {r['rsi']} | Depth: {ob_ratio:.2f}")
 
-    body_lines.append("\n💡 Monitoring 24/7. Will alert immediately when a high-probability trade confirms.")
+    body_lines.append("\n💡 Monitoring 24/7 with LightGBM. Will alert immediately when a high-probability trade confirms.")
     summary_message = "\n".join(body_lines)
 
     send_alert(
@@ -325,7 +416,6 @@ if __name__ == "__main__":
 
     if args.once:
         exchange = get_binance_exchange()
-        # Also auto-detect if the current time matches 9:00 AM or 7:00 PM EDT
         now_ny = datetime.now(ZoneInfo("America/New_York"))
         auto_briefing = args.briefing or (now_ny.hour in [9, 19] and now_ny.minute < 30)
         run_scanner_cycle(exchange, is_scheduled_summary=auto_briefing, is_manual_run=args.manual)
