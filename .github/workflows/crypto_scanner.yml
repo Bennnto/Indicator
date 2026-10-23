@@ -1,0 +1,33 @@
+name: 24/7 AI Crypto Analyst Scanner
+
+on:
+  schedule:
+    # Runs automatically every 30 minutes (:00 and :30) 24/7 in GitHub Cloud
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # Allows manual "Run workflow" button in GitHub web or mobile app
+
+jobs:
+  scan:
+    name: Scan Crypto Markets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas feedparser requests numpy
+
+      - name: Run Crypto AI Analyst
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'ben-secret107468' }}
+        run: |
+          python src/main.py --once
