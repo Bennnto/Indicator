@@ -1,4 +1,4 @@
-# 24/7 AI Crypto Analyst & Signal Copilot
+INDICATOR AND NOTIFICATION
 
 An algorithmic trading copilot that combines **multi-timeframe technical analysis** (1h macro trend + 15m RSI/ATR triggers) with **breaking news sentiment & red-flag veto filters**, delivering instant push notifications to your phone via [ntfy.sh](https://ntfy.sh).
 
