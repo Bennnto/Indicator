@@ -3,7 +3,7 @@ import time
 import argparse
 from datetime import datetime, timedelta
 
-from data_engine import fetch_multi_timeframe, coins
+from data_engine import fetch_multi_timeframe, coins, get_binance_exchange
 from indicators import analyze_technicals
 from news_engine import analyze_news
 from notifier import send_alert, DEFAULT_NTFY_TOPIC
@@ -114,21 +114,44 @@ def synthesize_trade_decision(symbol: str, exchange) -> dict:
     }
 
 
+def format_alert_title(d: dict) -> str:
+    """
+    Creates a prominent lock-screen notification title that displays
+    the coin, entry price, and stop-loss directly in the notification banner.
+    No 'AI' word used.
+    Example: 🟢 BUY BTC/USDT @ $81,350.00 | SL: $79,800.00
+    """
+    direction_emoji = "🟢" if "BUY" in d['action'] else "🔴"
+    action_short = "BUY" if "BUY" in d['action'] else "SHORT"
+    entry_str = f"${d['entry_limit']:,.2f}" if d.get('entry_limit') else f"${d['live_price']:,.2f}"
+    sl_str = f"${d['stop_loss']:,.2f}" if d.get('stop_loss') else "N/A"
+    return f"{direction_emoji} {action_short} {d['symbol']} @ {entry_str} | SL: {sl_str}"
+
+
 def format_alert_body(d: dict) -> str:
-    """Formats an approved trade setup into a structured alert text."""
+    """
+    Formats an approved trade setup into a structured trade decision card.
+    No 'AI' word used.
+    """
+    risk_pct = d['gaps'].get('risk_pct', 'N/A')
+    tp1_pct = d['gaps'].get('tp1_pct', 'N/A')
+    tp2_pct = d['gaps'].get('tp2_pct', 'N/A')
+
     return (
-        f"Pair: {d['symbol']} ({d['mode']})\n"
-        f"Action: {d['action']}\n\n"
-        f"💵 Live Price : ${d['live_price']:,}\n"
-        f"🎯 Limit Entry: ${d['entry_limit']:,}\n"
-        f"🛡️ Stop-Loss  : ${d['stop_loss']:,} ({d['gaps'].get('risk_pct', 'N/A')})\n"
-        f"🎯 Target 1   : ${d['tp1']:,} ({d['gaps'].get('tp1_pct', 'N/A')})\n"
-        f"🎯 Target 2   : ${d['tp2']:,} ({d['gaps'].get('tp2_pct', 'N/A')})\n\n"
-        f"📈 1h Trend   : {d['macro_trend']}\n"
-        f"📊 15m RSI    : {d['rsi']}\n"
-        f"📰 News       : {d['news_sentiment']}\n"
-        f"Top Story: \"{d['top_headline']}\"\n\n"
-        f"Thesis: {d['reasons'][0]}"
+        f"🚨 TRADE SIGNAL: {d['symbol']} ({d['mode']})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Action         : {d['action']}\n"
+        f"📍 Entry Price : ${d['entry_limit']:,.2f}\n"
+        f"🛑 Stop Loss at: ${d['stop_loss']:,.2f} ({risk_pct} Risk)\n"
+        f"🎯 Target 1 at : ${d['tp1']:,.2f} ({tp1_pct} Gain | 1.5R)\n"
+        f"🎯 Target 2 at : ${d['tp2']:,.2f} ({tp2_pct} Gain | 2.5R)\n"
+        f"💵 Current Live: ${d['live_price']:,.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 1h Trend    : {d['macro_trend']}\n"
+        f"📊 15m RSI     : {d['rsi']}\n"
+        f"📰 News        : {d['news_sentiment']}\n"
+        f"Top Story      : \"{d['top_headline']}\"\n\n"
+        f"💡 Thesis      : {d['reasons'][0]}"
     )
 
 
@@ -162,7 +185,7 @@ def run_scanner_cycle(exchange):
                     print(f"   ⏳ Cooldown active for {pair} (Alerted within last {ALERT_COOLDOWN_HOURS}h). Skipping dispatch.")
                 else:
                     print(f"   🔥 Approved setup found! Dispatching push alert for {pair}...")
-                    alert_title = f"🚨 {d['symbol']} {d['action']}"
+                    alert_title = format_alert_title(d)
                     alert_body = format_alert_body(d)
                     sent = send_alert(alert_body, title=alert_title, imessage_recipient=ALERT_RECIPIENT)
                     if sent:
@@ -185,7 +208,7 @@ def seconds_until_next_candle_close(interval_minutes: int = 30) -> int:
     second = now.second
 
     minutes_left = interval_minutes - (minute % interval_minutes)
-    target_seconds = (minutes_left * 60) - second + 5  # 5-second buffer
+    target_seconds = (minutes_left * 60) - second + 5
 
     if target_seconds <= 0:
         target_seconds += interval_minutes * 60
@@ -198,8 +221,9 @@ def run_continuous_daemon(interval_minutes: int = 30):
     Runs the scanner continuously on an automatic schedule, synchronized
     to every 30-minute boundary (:00 and :30).
     """
-    exchange = ccxt.binance({'enableRateLimit': True})
-    print(f"🚀 AI Crypto Analyst Daemon Online")
+    exchange = get_binance_exchange()
+    print(f"🚀 Crypto Analyst Scanner Daemon Online")
+    print(f"Data Source       : Binance Official Data API (Vision Mirror)")
     print(f"Scheduled Interval: Every {interval_minutes} minutes (Aligned with :00 and :30 boundaries)")
     print(f"Monitoring Pairs  : {', '.join(coins)}")
     print(f"Alert Channel     : https://ntfy.sh/{NTFY_TOPIC}")
@@ -227,7 +251,7 @@ def run_continuous_daemon(interval_minutes: int = 30):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AI Crypto Analyst Scanner")
+    parser = argparse.ArgumentParser(description="Crypto Analyst Scanner")
     parser.add_argument(
         "--once",
         action="store_true",
@@ -243,7 +267,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.once:
-        exchange = ccxt.binance({'enableRateLimit': True})
+        exchange = get_binance_exchange()
         run_scanner_cycle(exchange)
     else:
         run_continuous_daemon(interval_minutes=args.interval)
