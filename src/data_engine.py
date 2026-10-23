@@ -7,32 +7,54 @@ coins = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 
 def get_binance_exchange():
     """
-    Returns a Binance CCXT client configured with Binance's official public
-    data mirror (https://data-api.binance.vision).
-    
-    This provides 100% exact Binance market data without HTTP 451 geo-restrictions
-    on GitHub Actions or cloud servers.
+    Returns a Binance CCXT client strictly locked to SPOT market endpoints.
+    Points to Binance's official data mirror (data-api.binance.vision) and
+    explicitly disables all futures (fapi/dapi) requests to prevent HTTP 451
+    geo-restriction errors on GitHub Actions and US cloud servers.
     """
     return ccxt.binance({
         'enableRateLimit': True,
+        'options': {
+            'defaultType': 'spot',
+            'fetchMarkets': ['spot'],  # Strictly block any fapi / futures calls
+            'adjustForTimeDifference': True,
+        },
         'urls': {
             'api': {
                 'public': 'https://data-api.binance.vision/api/v3',
+                'fapiPublic': 'https://data-api.binance.vision/api/v3',
+                'fapiPrivate': 'https://data-api.binance.vision/api/v3',
             }
         }
     })
 
 
+def get_fallback_exchange():
+    """Global fallback exchange if Binance is unreachable from a cloud IP."""
+    return ccxt.okx({'enableRateLimit': True})
+
+
 def fetch_candles(exchange, symbol: str, timeframe: str = '1h', limit: int = 300) -> pd.DataFrame:
-    """Fetches a single batch of OHLCV candles from Binance."""
+    """
+    Fetches OHLCV candles from Binance, with automatic fallback if geo-blocked.
+    """
     try:
         bars = exchange.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        print(f"❌ Error fetching {timeframe} candles for {symbol}: {e}")
-        return pd.DataFrame()
+        print(f"⚠️ Binance {timeframe} error for {symbol}: {e}. Trying fallback exchange...")
+        try:
+            fb = get_fallback_exchange()
+            bars = fb.fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=limit)
+            df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            print(f"✅ Fallback successful for {symbol} ({len(df)} candles)")
+            return df
+        except Exception as fb_err:
+            print(f"❌ Fallback failed for {symbol}: {fb_err}")
+            return pd.DataFrame()
 
 
 def fetch_paginated_ohlcv(exchange, symbol: str, timeframe: str = '15m', days: int = 90) -> pd.DataFrame:
@@ -46,7 +68,7 @@ def fetch_paginated_ohlcv(exchange, symbol: str, timeframe: str = '15m', days: i
     since_dt = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=days)
     since_ms = int(since_dt.timestamp() * 1000)
 
-    print(f"  📅 Fetching {days} days of {timeframe} data from Binance for {symbol}...")
+    print(f"  📅 Fetching {days} days of {timeframe} data for {symbol}...")
 
     while True:
         try:
@@ -92,7 +114,8 @@ def fetch_multi_timeframe(exchange, symbol: str,
 
 if __name__ == "__main__":
     exchange = get_binance_exchange()
-    print("Checking live Binance Vision mirror:")
+    print("Testing Binance Spot Vision:")
     for coin in coins:
-        ticker = exchange.fetch_ticker(coin)
-        print(f"  {coin}: ${ticker['last']:,.2f}")
+        bars = fetch_candles(exchange, coin, timeframe='15m', limit=3)
+        if not bars.empty:
+            print(f"  ✅ {coin}: ${bars['close'].iloc[-1]:,.2f}")

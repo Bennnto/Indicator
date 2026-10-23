@@ -1,4 +1,4 @@
-name: 24/7 AI Crypto Analyst Scanner
+name: 24/7 Crypto Analyst Scanner
 
 on:
   schedule:
