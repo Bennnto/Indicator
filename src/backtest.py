@@ -1,136 +1,174 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import ccxt
+import argparse
 import pandas as pd
-from data_engine import fetch_paginated_ohlcv
+import numpy as np
+from data_engine import fetch_paginated_ohlcv, get_binance_exchange, coins
 from indicators import (
     compute_ema, compute_rsi, compute_atr, compute_adx,
-    compute_volume_ratio, compute_macd, update_trailing_stop, kelly_position_size,
+    compute_volume_ratio, compute_macd, update_trailing_stop,
+    check_candlestick_reversal, kelly_position_size,
     ATR_SL_MULTIPLIER, ATR_ENTRY_DISCOUNT, ATR_TRAIL_MULT,
     TP1_RR, TP2_RR, PARTIAL_EXIT_PCT
 )
+from ml_engine import predict_probability
 
 # ======================================================================
-# THRESHOLDS
+# STRATEGY THRESHOLDS (Institutional Confluence Suite)
 # ======================================================================
-ADX_MIN       = 15
-RSI_LONG_MAX  = 45
-RSI_SHORT_MIN = 55
-VOL_SPIKE_MAX = 1.8
-CONSEC_LOSS_MAX = 2
-CIRCUIT_PAUSE   = 8   # 15m bars = 2 hours
+ADX_MIN         = 18
+RSI_LONG_MAX    = 45
+RSI_SHORT_MIN   = 55
+VOL_SPIKE_MAX   = 1.8
+MIN_LGBM_PROB   = 0.55  # Minimum statistical win probability required from LightGBM
 
 
-def run_backtest(symbol: str = 'BTC/USDT', days: int = 90,
-                 capital: float = 10000.0) -> dict:
+def run_backtest(symbol: str = 'BTC/USDT', days: int = 45,
+                 capital: float = 10000.0,
+                 use_4h_filter: bool = True,
+                 use_candlestick_filter: bool = True,
+                 use_lgbm_filter: bool = True) -> dict:
     """
-    Full multi-timeframe backtest using paginated 90-day 15m data.
-    Uses 1h candles for macro trend, 15m for entries.
-    All V2 + V3 upgrades active.
+    Comprehensive historical backtest on Binance data testing:
+    1. 4h Macro Trend Confluence (Close > 4h EMA50)
+    2. 1h Intermediate Trend (EMA50 > EMA200)
+    3. 15m RSI Pullback (< 45) + Volume (< 1.8x) + ADX (> 18) + MACD
+    4. 15m Candlestick Reversal (Falling knife protection)
+    5. LightGBM Quantitative Win Predictor
+    6. Trade Management: Limit Entry, 2.0 ATR Stop, Breakeven at +1.0R, TP1 at 1.5R, TP2 at 2.5R
     """
-    exchange = ccxt.binance({'enableRateLimit': True})
+    exchange = get_binance_exchange()
 
-    print(f"\n{'='*60}")
-    print(f"⏳  Loading {days}-day history for {symbol}...")
-    print(f"{'='*60}")
+    print(f"\n{'='*65}")
+    print(f"⏳ Loading {days}-Day Multi-Timeframe Binance History for {symbol}...")
+    print(f"{'='*65}")
 
-    # Paginated 15m data (90 days ≈ 8640 bars)
+    # 1. Fetch 15m candles
     df15 = fetch_paginated_ohlcv(exchange, symbol, timeframe='15m', days=days)
     if df15.empty or len(df15) < 300:
-        print(f"  ❌ Not enough 15m data for {symbol}")
+        print(f"  ❌ Insufficient 15m data for {symbol}")
         return {}
 
-    # 1h data for macro trend (fetch extra for EMA 200 warmup)
-    df1h = fetch_paginated_ohlcv(exchange, symbol, timeframe='1h', days=days + 10)
-    if df1h.empty:
-        print(f"  ❌ Not enough 1h data for {symbol}")
+    # 2. Fetch 1h candles
+    df1h = fetch_paginated_ohlcv(exchange, symbol, timeframe='1h', days=days + 15)
+    if df1h.empty or len(df1h) < 200:
+        print(f"  ❌ Insufficient 1h data for {symbol}")
         return {}
 
-    # 1h EMAs
+    # 3. Fetch 4h candles
+    df4h = fetch_paginated_ohlcv(exchange, symbol, timeframe='4h', days=days + 25)
+
+    # Compute 1h Indicators
     df1h = df1h.rename(columns={'timestamp': 'time'})
     df1h['ema_50_1h']  = compute_ema(df1h['close'], 50)
     df1h['ema_200_1h'] = compute_ema(df1h['close'], 200)
 
-    # Merge 1h trend into 15m (no lookahead bias via backward merge)
-    df15 = df15.rename(columns={'timestamp': 'time'})
-    df = pd.merge_asof(df15, df1h[['time', 'ema_50_1h', 'ema_200_1h']],
-                       on='time', direction='backward')
+    # Compute 4h Indicators
+    if not df4h.empty and len(df4h) >= 50:
+        df4h = df4h.rename(columns={'timestamp': 'time'})
+        df4h['ema_50_4h'] = compute_ema(df4h['close'], 50)
+        df15_merged = pd.merge_asof(
+            df15.rename(columns={'timestamp': 'time'}).sort_values('time'),
+            df4h[['time', 'ema_50_4h']].sort_values('time'),
+            on='time', direction='backward'
+        )
+    else:
+        df15_merged = df15.rename(columns={'timestamp': 'time'})
+        df15_merged['ema_50_4h'] = np.nan
 
-    # 15m indicators
-    df['rsi']     = compute_rsi(df['close'], 14)
-    df['atr']     = compute_atr(df, 14)
-    df['adx']     = compute_adx(df, 14)
-    df['vol']     = compute_volume_ratio(df['volume'], 20)
-    _, _, mh      = compute_macd(df['close'])
-    df['macd_h']  = mh
+    # Merge 1h trend into 15m without lookahead bias
+    df = pd.merge_asof(
+        df15_merged.sort_values('time'),
+        df1h[['time', 'ema_50_1h', 'ema_200_1h']].sort_values('time'),
+        on='time', direction='backward'
+    )
 
-    # Simulation loop
-    trades         = []
-    active         = None
-    cons_loss      = 0
-    pause_idx      = 0
+    # 15m Technicals
+    df['rsi']    = compute_rsi(df['close'], 14)
+    df['atr']    = compute_atr(df, 14)
+    df['adx']    = compute_adx(df, 14)
+    df['vol']    = compute_volume_ratio(df['volume'], 20)
+    _, _, mh     = compute_macd(df['close'])
+    df['macd_h'] = mh
+
+    # Simulation State
+    trades = []
+    active = None
     running_capital = capital
+    setups_encountered = 0
+    setups_filtered_by_4h = 0
+    setups_filtered_by_candle = 0
+    setups_filtered_by_lgbm = 0
 
     for i in range(200, len(df) - 1):
         row = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+
         if pd.isna(row.get('ema_50_1h')) or pd.isna(row.get('ema_200_1h')):
             continue
 
         # ------------------------------------------------------------
-        # Manage open trade
+        # TRADE MANAGEMENT: Active position simulation
         # ------------------------------------------------------------
         if active is not None:
             side = active['side']
+            entry_p = active['entry']
+            r_dist = active['r_dist']
 
-            # Update trailing stop
-            active['trail_sl'] = update_trailing_stop(
-                row['close'], active['trail_sl'], row['atr'], side, ATR_TRAIL_MULT
-            )
-
+            # Move stop to breakeven once price reaches +1.0R
             if side == 'LONG':
+                if row['high'] >= (entry_p + (1.0 * r_dist)) and not active['be_moved']:
+                    active['trail_sl'] = entry_p
+                    active['be_moved'] = True
+
                 hit_tp1 = row['high'] >= active['tp1'] and not active['tp1_hit']
                 hit_tp2 = row['high'] >= active['tp2']
                 hit_sl  = row['low']  <= active['trail_sl']
             else:
+                if row['low'] <= (entry_p - (1.0 * r_dist)) and not active['be_moved']:
+                    active['trail_sl'] = entry_p
+                    active['be_moved'] = True
+
                 hit_tp1 = row['low']  <= active['tp1'] and not active['tp1_hit']
                 hit_tp2 = row['low']  <= active['tp2']
                 hit_sl  = row['high'] >= active['trail_sl']
 
-            # Partial exit at TP1
+            # Partial exit at TP1 (50%)
             if hit_tp1:
-                active['tp1_hit']   = True
-                active['trail_sl']  = active['entry']   # Move stop to breakeven
+                active['tp1_hit'] = True
+                active['trail_sl'] = entry_p  # Ensure stop is at breakeven
                 active['partial_r'] = TP1_RR * PARTIAL_EXIT_PCT
 
             # Full exit at TP2
             if hit_tp2:
-                active['pnl_r'] = round(
-                    active.get('partial_r', 0) + TP2_RR * (1 - PARTIAL_EXIT_PCT), 2)
+                active['pnl_r'] = round(active.get('partial_r', 0) + (TP2_RR * (1 - PARTIAL_EXIT_PCT)), 2)
                 active['exit']  = 'TP2'
                 trades.append(active)
-                cons_loss        = 0
                 running_capital += active['risk_usdt'] * active['pnl_r']
                 active = None
 
             elif hit_sl:
-                partial = active.get('partial_r', 0)
                 if active.get('tp1_hit'):
-                    active['pnl_r'] = round(partial, 2)
-                    active['exit']  = 'BE_TP1'
-                    cons_loss       = 0
+                    active['pnl_r'] = round(active.get('partial_r', 0), 2)
+                    active['exit']  = 'BE_AFTER_TP1'
+                elif active.get('be_moved'):
+                    active['pnl_r'] = 0.0
+                    active['exit']  = 'BREAKEVEN'
                 else:
                     active['pnl_r'] = -1.0
                     active['exit']  = 'SL'
-                    cons_loss += 1
-                    if cons_loss >= CONSEC_LOSS_MAX:
-                        pause_idx = i + CIRCUIT_PAUSE
-                        cons_loss = 0
+
                 trades.append(active)
                 running_capital += active['risk_usdt'] * active['pnl_r']
                 active = None
 
         # ------------------------------------------------------------
-        # Look for new setups
+        # SIGNAL SCANNING: Look for new high-probability entries
         # ------------------------------------------------------------
-        elif i >= pause_idx:
+        else:
             c    = row['close']
             e50  = row['ema_50_1h']
             e200 = row['ema_200_1h']
@@ -139,113 +177,161 @@ def run_backtest(symbol: str = 'BTC/USDT', days: int = 90,
             adx  = row['adx']
             vol  = row['vol']
             mh_  = row['macd_h']
+            e50_4h = row.get('ema_50_4h')
 
             if any(pd.isna(v) for v in [rsi, atr, adx, vol, mh_]):
                 continue
-            if adx < ADX_MIN or vol > VOL_SPIKE_MAX:
-                continue
 
-            prev_mh = df['macd_h'].iloc[i - 1]
-            macd_up   = mh_ > prev_mh
-            macd_down = mh_ < prev_mh
+            # Check for candidate pullback in 1h uptrend
+            is_1h_bull = (c > e50) and (e50 > e200)
+            is_rsi_dip = rsi < RSI_LONG_MAX
+            macd_turning_up = mh_ > df['macd_h'].iloc[i - 1]
 
-            # Kelly sizing
-            wr = 0.50
-            if len(trades) >= 10:
-                wr = sum(1 for t in trades if t.get('pnl_r', 0) > 0) / len(trades)
-            kelly     = kelly_position_size(wr, TP1_RR, running_capital, c)
-            risk_usdt = kelly['risk_usdt']
+            if is_1h_bull and is_rsi_dip and macd_turning_up and adx >= ADX_MIN and vol <= VOL_SPIKE_MAX:
+                setups_encountered += 1
 
-            # LONG setup
-            if c > e50 > e200 and rsi < RSI_LONG_MAX and macd_up:
+                # 1. 4H MACRO CONFLUENCE FILTER
+                if use_4h_filter and not pd.isna(e50_4h) and c < e50_4h:
+                    setups_filtered_by_4h += 1
+                    continue
+
+                # 2. 15M CANDLESTICK CONFIRMATION FILTER
+                recent_df = df.iloc[max(0, i - 5):i + 1]
+                candle_ok, _ = check_candlestick_reversal(recent_df, side="LONG")
+                if use_candlestick_filter and not candle_ok:
+                    setups_filtered_by_candle += 1
+                    continue
+
+                # 3. LIGHTGBM STATISTICAL WIN PREDICTOR FILTER
+                o, h, l = row['open'], row['high'], row['low']
+                c_range = max(h - l, 1e-8)
+                lower_wick = max(0.0, min(o, c) - l) / c_range
+                is_green = 1.0 if c >= o else 0.0
+
+                lgbm_features = {
+                    'rsi_15m': rsi,
+                    'macd_hist_15m': mh_,
+                    'adx_15m': adx,
+                    'volume_ratio': vol,
+                    'extension_from_ema50': ((c - e50) / e50) * 100.0,
+                    'ema50_over_ema200': 1.0,
+                    'lower_wick_ratio': lower_wick,
+                    'candle_is_green': is_green,
+                    'ob_ratio': 1.0,
+                    'btc_trend_bullish': 1.0
+                }
+                ml_pred = predict_probability(lgbm_features)
+
+                if use_lgbm_filter and ml_pred['prob'] < MIN_LGBM_PROB:
+                    setups_filtered_by_lgbm += 1
+                    continue
+
+                # Entry sizing
                 e  = c - (ATR_ENTRY_DISCOUNT * atr)
                 sl = e - (ATR_SL_MULTIPLIER * atr)
                 r  = e - sl
-                active = {
-                    'side': 'LONG', 'entry': round(e, 4),
-                    'trail_sl': round(sl, 4),
-                    'tp1': round(e + TP1_RR * r, 4),
-                    'tp2': round(e + TP2_RR * r, 4),
-                    'tp1_hit': False, 'time': row['time'],
-                    'risk_usdt': risk_usdt
-                }
 
-            # SHORT setup
-            elif c < e50 < e200 and rsi > RSI_SHORT_MIN and macd_down:
-                e  = c + (ATR_ENTRY_DISCOUNT * atr)
-                sl = e + (ATR_SL_MULTIPLIER * atr)
-                r  = sl - e
+                kelly = kelly_position_size(win_rate=ml_pred['prob'], rr_ratio=TP1_RR, capital=running_capital, price=c)
+                risk_usdt = kelly['risk_usdt']
+
                 active = {
-                    'side': 'SHORT', 'entry': round(e, 4),
+                    'side': 'LONG',
+                    'entry': round(e, 4),
                     'trail_sl': round(sl, 4),
-                    'tp1': round(e - TP1_RR * r, 4),
-                    'tp2': round(e - TP2_RR * r, 4),
-                    'tp1_hit': False, 'time': row['time'],
-                    'risk_usdt': risk_usdt
+                    'r_dist': round(r, 4),
+                    'tp1': round(e + (TP1_RR * r), 4),
+                    'tp2': round(e + (TP2_RR * r), 4),
+                    'tp1_hit': False,
+                    'be_moved': False,
+                    'time': row['time'],
+                    'risk_usdt': risk_usdt,
+                    'ml_prob': ml_pred['prob_pct']
                 }
 
     # ------------------------------------------------------------
-    # Results
+    # Results Compilation
     # ------------------------------------------------------------
     if not trades:
-        print(f"  ⚪ No trades triggered for {symbol} in {days} days.")
+        print(f"  ⚪ No approved trades executed for {symbol} ({setups_encountered} raw setups filtered by strict safety rules).")
         return {}
 
     dt       = pd.DataFrame(trades)
     total    = len(dt)
     wins     = len(dt[dt['pnl_r'] > 0])
     losses   = len(dt[dt['pnl_r'] < 0])
-    be_count = len(dt[dt['exit'] == 'BE_TP1']) if 'exit' in dt.columns else 0
+    be_count = len(dt[dt['pnl_r'] == 0.0])
     net_r    = round(dt['pnl_r'].sum(), 2)
-    avg_r    = round(dt['pnl_r'].mean(), 3)
-    win_rate = round(wins / total * 100, 1)
-    longs    = dt[dt['side'] == 'LONG']
-    shorts   = dt[dt['side'] == 'SHORT']
-    pos_r    = dt[dt['pnl_r'] > 0]['pnl_r'].sum()
-    neg_r    = abs(dt[dt['pnl_r'] < 0]['pnl_r'].sum())
-    pf       = round(pos_r / max(neg_r, 0.01), 2)
+    win_rate = round((wins / total) * 100, 1)
 
-    est_pnl  = round(running_capital - capital, 2)
-    pnl_pct  = round((est_pnl / capital) * 100, 2)
+    pos_r = dt[dt['pnl_r'] > 0]['pnl_r'].sum()
+    neg_r = abs(dt[dt['pnl_r'] < 0]['pnl_r'].sum())
+    pf    = round(pos_r / max(neg_r, 0.01), 2)
+
+    est_pnl = round(running_capital - capital, 2)
+    pnl_pct = round((est_pnl / capital) * 100, 2)
 
     date_from = dt['time'].iloc[0].strftime('%Y-%m-%d')
     date_to   = dt['time'].iloc[-1].strftime('%Y-%m-%d')
 
-    print(f"\n{'='*60}")
-    print(f"📊  BACKTEST: {symbol}  |  {days} days  ({date_from} → {date_to})")
-    print(f"    Thresholds: ADX≥{ADX_MIN} | RSI<{RSI_LONG_MAX}L >{RSI_SHORT_MIN}S | Vol≤{VOL_SPIKE_MAX}x")
-    print(f"{'='*60}")
-    print(f"  Capital       : ${capital:,.0f}  →  ${running_capital:,.2f}  ({pnl_pct:+.1f}%)")
-    print(f"  Total Trades  : {total}  ({len(longs)}L / {len(shorts)}S)")
-    print(f"  Win / Loss    : {wins}W / {losses}L  (+{be_count} breakeven after TP1)")
-    print(f"  Win Rate      : {win_rate}%")
-    print(f"  Avg Trade     : {avg_r:+.3f}R")
-    print(f"  Net Return    : {net_r:+.2f}R")
-    print(f"  Profit Factor : {pf}")
-    print(f"  Long  W/L     : {len(longs[longs['pnl_r']>0])}W / {len(longs[longs['pnl_r']<0])}L")
-    print(f"  Short W/L     : {len(shorts[shorts['pnl_r']>0])}W / {len(shorts[shorts['pnl_r']<0])}L")
-    verdict = "✅ PROFITABLE" if net_r > 0 and pf >= 1.2 else "⚠️ NEEDS TUNING"
-    print(f"  Verdict       : {verdict}")
+    print(f"\n📊 RESULTS FOR {symbol} ({days} Days: {date_from} → {date_to}):")
+    print(f"   Raw Pullback Setups Found   : {setups_encountered}")
+    print(f"   Filtered by 4h Downtrend    : -{setups_filtered_by_4h}")
+    print(f"   Filtered by Candlestick     : -{setups_filtered_by_candle}")
+    print(f"   Filtered by LightGBM (<55%) : -{setups_filtered_by_lgbm}")
+    print(f"   Approved Trades Executed    : {total}")
+    print(f"   -------------------------------------------")
+    print(f"   🏆 Realized Win Rate        : {win_rate}% ({wins}W / {losses}L / {be_count} Breakeven)")
+    print(f"   📈 Profit Factor            : {pf}")
+    print(f"   💰 Cumulative Return        : {pnl_pct:+.2f}% (${running_capital:,.2f})")
+    print(f"   🛡️ Net Realized R           : {net_r:+.2f}R")
 
     return {
-        'symbol': symbol, 'trades': total, 'win_rate': win_rate,
-        'net_r': net_r, 'pf': pf, 'est_pnl': est_pnl, 'pnl_pct': pnl_pct
+        'symbol': symbol,
+        'setups': setups_encountered,
+        'trades': total,
+        'win_rate': win_rate,
+        'wins': wins,
+        'losses': losses,
+        'breakevens': be_count,
+        'net_r': net_r,
+        'pf': pf,
+        'pnl_pct': pnl_pct
     }
 
 
 if __name__ == "__main__":
-    summary = []
-    for coin in ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT']:
-        result = run_backtest(symbol=coin, days=90, capital=10000.0)
-        if result:
-            summary.append(result)
+    parser = argparse.ArgumentParser(description="Multi-Timeframe Quantitative Backtester")
+    parser.add_argument("--days", type=int, default=60, help="Number of historical days to backtest (default: 60)")
+    parser.add_argument("--symbol", type=str, default="ALL", help="Coin symbol or ALL")
+    args = parser.parse_args()
 
-    if summary:
-        print(f"\n{'='*60}")
-        print("📋  PORTFOLIO SUMMARY  (90-day | $10,000 start)")
-        print(f"{'='*60}")
-        for r in summary:
-            icon = "✅" if r['net_r'] > 0 else "❌"
-            print(f"  {icon} {r['symbol']:<12}  WR:{r['win_rate']}%  "
-                  f"Net:{r['net_r']:+.1f}R  PF:{r['pf']}  "
-                  f"P&L: ${r['est_pnl']:+,.2f} ({r['pnl_pct']:+.1f}%)")
+    test_coins = coins if args.symbol == "ALL" else [args.symbol]
+    portfolio_results = []
+
+    print("=" * 65)
+    print("🚀 RUNNING HISTORICAL BACKTEST WITH LIGHTGBM + 4H + CANDLESTICKS")
+    print(f"   Pairs: {', '.join(test_coins)} | Lookback: {args.days} Days")
+    print("=" * 65)
+
+    for coin in test_coins:
+        res = run_backtest(symbol=coin, days=args.days, capital=10000.0)
+        if res:
+            portfolio_results.append(res)
+
+    if portfolio_results:
+        print("\n" + "=" * 65)
+        print("🏆 PORTFOLIO BACKTEST SUMMARY")
+        print("=" * 65)
+        total_trades = sum(r['trades'] for r in portfolio_results)
+        total_wins = sum(r['wins'] for r in portfolio_results)
+        total_losses = sum(r['losses'] for r in portfolio_results)
+        total_be = sum(r['breakevens'] for r in portfolio_results)
+        avg_wr = round((total_wins / total_trades) * 100, 1) if total_trades > 0 else 0
+        total_pnl = round(sum(r['pnl_pct'] for r in portfolio_results) / len(portfolio_results), 2)
+        total_r = round(sum(r['net_r'] for r in portfolio_results), 2)
+
+        print(f"Total Approved Trades: {total_trades}")
+        print(f"Overall Win Rate     : {avg_wr}% ({total_wins} Wins / {total_losses} Losses / {total_be} Breakeven)")
+        print(f"Total Net R          : {total_r:+.2f}R")
+        print(f"Avg Portfolio Return : {total_pnl:+.2f}%")
+        print("=" * 65)
