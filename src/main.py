@@ -417,7 +417,7 @@ if __name__ == "__main__":
     if args.once:
         exchange = get_binance_exchange()
         now_ny = datetime.now(ZoneInfo("America/New_York"))
-        auto_briefing = args.briefing or (now_ny.hour in [9, 19] and now_ny.minute < 30)
+        auto_briefing = args.briefing or (now_ny.hour in [9, 10, 19, 20])
         run_scanner_cycle(exchange, is_scheduled_summary=auto_briefing, is_manual_run=args.manual)
     else:
         run_continuous_daemon(interval_minutes=args.interval)

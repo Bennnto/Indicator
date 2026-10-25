@@ -1,0 +1,35 @@
+name: Daily Market Briefings
+
+on:
+  schedule:
+    # 9:00 AM EDT (13:00 UTC)
+    - cron: '0 13 * * *'
+    # 7:00 PM EDT (23:00 UTC)
+    - cron: '0 23 * * *'
+  workflow_dispatch: # Allows manual "Run workflow" test in GitHub web/mobile app
+
+jobs:
+  briefing:
+    name: Send 9 AM / 7 PM Market Briefing
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt pandas feedparser requests numpy lightgbm scikit-learn joblib
+
+      - name: Dispatch Market Briefing
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'ben-secret107468' }}
+        run: |
+          python src/main.py --once --briefing
